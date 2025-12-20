@@ -1,0 +1,7 @@
+# 视频Web服务器依赖包列表
+Flask>=2.0.0          # Web框架
+psutil>=5.8.0         # 系统进程和网络监控
+Pillow>=9.0.0         # 图像处理（托盘图标）
+pystray>=0.19.0       # 系统托盘图标
+waitress>=2.1.0       # WSGI生产服务器
+requests>=2.25.0      # HTTP请求库
