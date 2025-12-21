@@ -2487,7 +2487,25 @@ def video(filename):
     length = byte2 - byte1 + 1
     
     def generate_range():
-        """生成指定范围的文件流"""
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(byte1)  # 定位到起始位置
+                remaining = length
+                
+                while remaining > 0:
+                    # 计算本次读取大小（最后一块可能小于CHUNK_SIZE）
+                    chunk_size = min(CHUNK_SIZE, remaining)
+                    data = f.read(chunk_size)
+                    
+                    if not data:
+                        break  # 文件意外结束
+                    
+                    remaining -= len(data)
+                    yield data  # 发送数据块
+        except IOError as e:
+            yield b''
+    
+    # 返回206 Partial Content响应
     return app.response_class(
         generate_range(),
         206,
