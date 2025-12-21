@@ -25,17 +25,18 @@ echo.
 
 echo [4/4] 打包EXE（需要几分钟）...
 pyinstaller --clean ^
-    --onefile ^
-    --noconsole ^
-    --name VideoWebServer ^
-    --icon=icon.ico ^
-    --hidden-import=waitress ^
-    --hidden-import=psutil ^
-    --hidden-import=pystray ^
-    --hidden-import=PIL ^
-    --hidden-import=PIL.Image ^
-    --hidden-import=PIL.ImageDraw ^
-    super_badass_videos_web_server.py
+  --onefile ^
+  --noconsole ^
+  --name VideoWebServer ^
+  --icon=icon.ico ^
+  --hidden-import=waitress ^
+  --hidden-import=psutil ^
+  --hidden-import=pystray ^
+  --hidden-import=PIL ^
+  --hidden-import=PIL.Image ^
+  --hidden-import=PIL.ImageDraw ^
+  --add-data "static;static" ^
+  super_badass_videos_web_server.py
 
 if errorlevel 1 (
     echo.

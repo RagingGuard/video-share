@@ -22,7 +22,19 @@ from PIL import Image, ImageDraw
 import pystray
 from waitress import serve
 
-app = Flask(__name__)
+
+def resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
+# 修复 PyInstaller --onefile 模式下 static 目录路径
+if getattr(sys, 'frozen', False):
+    application_path = sys._MEIPASS
+else:
+    application_path = os.path.dirname(os.path.abspath(__file__))
+
+app = Flask(__name__, static_folder=resource_path("static"))
 app.secret_key = secrets.token_hex(32)
 
 # 分块传输配置
@@ -351,6 +363,9 @@ def index():
     <title>视频分享中心</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <!-- 引入 video.js 样式 -->
+    <link rel="stylesheet" href="/static/video-js.min.css">
+
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         
@@ -1066,6 +1081,27 @@ def index():
                 display: none; /* 只显示图标 */
             }
         }
+        
+        video::-webkit-media-controls {
+        display: none !important;
+        .video-wrapper {
+        width: 100%;
+        max-width: 1000px;
+        aspect-ratio: 16 / 9;
+        background: black;
+        }
+
+        .video-js {
+        width: 100%;
+        height: 100%;
+        }
+
+}
+
+video::-webkit-media-controls-enclosure {
+    display: none !important;
+}
+
     </style>
 </head>
 <body class="{{ 'mobile' if is_mobile else 'desktop' }}">
@@ -1082,6 +1118,8 @@ def index():
                         <span class="fullpage-icon">⬜</span>
                         <span id="fullpageText">全页面</span>
                     </button>
+                    <!-- Audio track selector (populated by AudioTrackManager) -->
+                    <select id="audioTrackSelect" style="margin-left:12px; display:none;" aria-label="音轨选择"></select>
                 </div>
                 <div class="right-controls">
                     <button class="episode-btn" id="prevBtn" onclick="playPrevious()">
@@ -1094,7 +1132,46 @@ def index():
                     </button>
                 </div>
             </div>
-            <video id="player" controls playsinline webkit-playsinline preload="metadata"></video>
+            <!-- 
+            <video id="player" class="video-js vjs-default-skin" controls playsinline webkit-playsinline preload="metadata" data-setup="{}"></video>
+            
+            <video
+                id="player"
+                class="video-js"
+                controls
+                preload="auto"
+                data-setup='{}'>
+            </video>
+            <video
+                id="player"
+                controls
+                playsinline
+                webkit-playsinline
+                preload="metadata">
+            </video>
+            <video
+            id="player"
+            class="video-js vjs-default-skin"
+            playsinline
+            webkit-playsinline
+            preload="metadata"
+            controlslist="nodownload nofullscreen noplaybackrate"
+            disablePictureInPicture
+            >
+            </video>
+            -->
+
+            <div class="video-wrapper">
+                <video
+                    id="player"
+                    class="video-js vjs-default-skin"
+                    playsinline
+                    webkit-playsinline
+                    preload="metadata"
+                >
+                </video>
+            </div>
+
             <div class="video-title" id="videoTitle"></div>
         </div>
         <div class="empty-state" id="emptyState">
@@ -1129,9 +1206,137 @@ def index():
         </div>
     </div>
     
+    <!-- 引入 video.js 脚本 -->
+    <script src="/static/video.min.js"></script>
+
+
+    <script>
+    // Note: Video.js player is initialized once in the main script block below.
+    /* Inlined AudioTrackManager (previously external file) */
+    (function(){
+        class AudioTrackManager {
+            constructor(video, engine = null) {
+                this.video = video;
+                this.engine = engine;
+            }
+
+            getTracks() {
+                // hls.js
+                if (this.engine && this.engine.audioTracks) {
+                    return this.engine.audioTracks.map((t, i) => ({
+                        id: i,
+                        lang: t.lang || '',
+                        label: t.name || `Track ${i}`,
+                        selected: i === this.engine.audioTrack,
+                        source: 'hls'
+                    }));
+                }
+
+                // dash.js
+                if (this.engine && this.engine.getTracksFor) {
+                    return this.engine.getTracksFor('audio').map((t, i) => ({
+                        id: i,
+                        lang: t.lang || '',
+                        label: t.lang || `Track ${i}`,
+                        selected: t === this.engine.getCurrentTrackFor('audio'),
+                        source: 'dash'
+                    }));
+                }
+
+                // native audioTracks (Safari / some browsers)
+                const tracks = this.video && this.video.audioTracks;
+                if (tracks && tracks.length) {
+                    return Array.from(tracks).map((t, i) => ({
+                        id: i,
+                        lang: t.language || '',
+                        label: t.label || `Track ${i}`,
+                        selected: !!t.enabled,
+                        source: 'native'
+                    }));
+                }
+
+                return [];
+            }
+
+            select(track) {
+                // hls.js
+                if (this.engine && this.engine.audioTracks) {
+                    if (typeof track === 'number') {
+                        this.engine.audioTrack = track;
+                        return true;
+                    }
+                    const i = this.engine.audioTracks.findIndex(t => t.lang === track);
+                    if (i >= 0) {
+                        this.engine.audioTrack = i;
+                        return true;
+                    }
+                }
+
+                // dash.js
+                if (this.engine && this.engine.getTracksFor) {
+                    const tracks = this.engine.getTracksFor('audio');
+                    const target = typeof track === 'number'
+                        ? tracks[track]
+                        : tracks.find(t => t.lang === track);
+                    if (target) {
+                        // dash.js expects a track object
+                        try { this.engine.setCurrentTrack(target); } catch (e) { /* ignore */ }
+                        return true;
+                    }
+                }
+
+                // native
+                const nativeTracks = this.video && this.video.audioTracks;
+                if (nativeTracks && nativeTracks.length) {
+                    for (let i = 0; i < nativeTracks.length; i++) {
+                        try {
+                            nativeTracks[i].enabled =
+                                (typeof track === 'number'
+                                    ? i === track
+                                    : nativeTracks[i].language === track);
+                        } catch (e) {
+                            // Some browsers make audioTracks read-only; ignore silently
+                        }
+                    }
+                    return true;
+                }
+
+                return false;
+            }
+
+            onTrackChange(callback) {
+                if (this.engine && typeof this.engine.on === 'function') {
+                    // hls.js
+                    try {
+                        this.engine.on('AUDIO_TRACK_SWITCHED', () => callback(this.getTracks()));
+                    } catch (e) { /* ignore */ }
+                } else if (this.engine && typeof this.engine.onTrackChange === 'function') {
+                    try {
+                        this.engine.onTrackChange(() => callback(this.getTracks()));
+                    } catch (e) { /* ignore */ }
+                } else if (this.video && this.video.audioTracks && 'onchange' in this.video.audioTracks) {
+                    try {
+                        this.video.audioTracks.onchange = () => callback(this.getTracks());
+                    } catch (e) { /* ignore */ }
+                } else {
+                    // no support
+                }
+            }
+        }
+
+        // expose to window
+        try { window.AudioTrackManager = AudioTrackManager; } catch (e) { /* server-side render? ignore */ }
+    })();
+    </script>
 <script>
 const videoListEl = document.getElementById('videoList');
-const player = document.getElementById('player');
+// Single Video.js player instance (do not re-initialize elsewhere)
+const player = videojs('player', {
+  controls: true,
+  fluid: true,
+  preload: 'metadata',
+  playbackRates: [0.5, 1, 1.25, 1.5, 2],
+});
 const playerContainer = document.getElementById('playerContainer');
 const emptyState = document.getElementById('emptyState');
 const videoTitle = document.getElementById('videoTitle');
@@ -1144,6 +1349,48 @@ const passwordInput = document.getElementById('passwordInput');
 const isMobile = document.body.classList.contains('mobile');
 const isSecretMode = {{ 'true' if is_secret_mode else 'false' }};
 let currentVideo = null;
+
+// Audio track manager integration
+const audioTrackSelect = document.getElementById('audioTrackSelect');
+let audioManager = null;
+
+function refreshAudioTracks() {
+    if (!audioTrackSelect) return;
+    try {
+        if (!audioManager) {
+            // Use the underlying <video> element (tech) so native audioTracks can be detected when available.
+            const techEl = (player && player.tech && player.tech()) ? player.tech().el() : null;
+            audioManager = new (window.AudioTrackManager || window.AudioTrackManager)(techEl, null);
+        }
+    } catch (e) {
+        console.warn('Failed to init AudioTrackManager:', e);
+        audioTrackSelect.style.display = 'none';
+        return;
+    }
+
+    const tracks = audioManager.getTracks();
+    audioTrackSelect.innerHTML = '';
+    if (!tracks || tracks.length === 0) {
+        audioTrackSelect.style.display = 'none';
+        return;
+    }
+
+    audioTrackSelect.style.display = 'inline-block';
+    tracks.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        opt.textContent = t.label || t.lang || ('Track ' + t.id);
+        if (t.selected) opt.selected = true;
+        audioTrackSelect.appendChild(opt);
+    });
+}
+
+if (audioTrackSelect) {
+    audioTrackSelect.addEventListener('change', (e) => {
+        const v = e.target.value;
+        if (audioManager) audioManager.select(Number(v));
+    });
+}
 let allVideos = [];
 let isAutoplayEnabled = false;
 let isFullpageMode = false;
@@ -1277,8 +1524,11 @@ function loadVideo(v, startFromBeginning = false) {
         '/video/' + encodeURIComponent(v) + '?secretnumber=' + secretToken : 
         '/video/' + encodeURIComponent(v);
     
-    player.src = videoUrl;
+
+    // Switch source via Video.js.
+    player.src({ src: videoUrl, type: 'video/mp4' });
     videoTitle.textContent = v;
+    audioManager = null;
     
     // 使用不同的storage key
     const storageKey = isSecretMode ? 'lastSecretVideo' : 'lastVideo';
@@ -1286,13 +1536,22 @@ function loadVideo(v, startFromBeginning = false) {
     
     localStorage.setItem(storageKey, v);
     
-    // 如果需要从头开始播放，则设置为0，否则恢复上次播放位置
+    // If needed, start from 0; otherwise restore last position.
+    // With Video.js, currentTime is a method: player.currentTime(seconds)
+    const targetTime = startFromBeginning
+        ? 0
+        : (parseFloat(localStorage.getItem(timeKey)) || 0);
     if (startFromBeginning) {
-        player.currentTime = 0;
         localStorage.setItem(timeKey, '0');
-    } else {
-        player.currentTime = parseFloat(localStorage.getItem(timeKey)) || 0;
     }
+    player.one('loadedmetadata', function() {
+        try {
+            player.currentTime(targetTime);
+        } catch (e) {
+            // ignore seek errors
+        }
+        try { refreshAudioTracks(); } catch (e) { /* ignore */ }
+    });
     
     playerContainer.style.display = 'block';
     emptyState.style.display = 'none';
@@ -1326,12 +1585,15 @@ function loadVideo(v, startFromBeginning = false) {
     // 更新按钮状态
     updateEpisodeButtons();
     
-    player.play();
+    try { player.play(); } catch (e) { /* autoplay might be blocked */ }
 }
 
 // 上报播放状态到服务器
 function reportPlayStatus() {
-    if (currentVideo && player.duration) {
+    if (currentVideo && player.duration && typeof player.duration === 'function') {
+        const dur = player.duration();
+        const pos = player.currentTime && typeof player.currentTime === 'function' ? player.currentTime() : 0;
+        if (!dur || !isFinite(dur)) return;
         fetch('/update-status', {
             method: 'POST',
             headers: {
@@ -1339,8 +1601,8 @@ function reportPlayStatus() {
             },
             body: JSON.stringify({
                 video: currentVideo,
-                position: player.currentTime,
-                duration: player.duration
+                position: pos,
+                duration: dur
             })
         }).catch(() => {});  // 忽略错误
     }
@@ -1350,12 +1612,15 @@ function reportPlayStatus() {
 setInterval(reportPlayStatus, 5000);
 
 // 记录播放进度和总时长
-player.ontimeupdate = function() {
-    if (currentVideo) {
-        const timeKey = isSecretMode ? 'secretVideoTime_' + currentVideo : 'videoTime_' + currentVideo;
-        localStorage.setItem(timeKey, player.currentTime);
+player.on('timeupdate', function() {
+    if (!currentVideo) return;
+    const timeKey = isSecretMode ? 'secretVideoTime_' + currentVideo : 'videoTime_' + currentVideo;
+    try {
+        localStorage.setItem(timeKey, String(player.currentTime()));
+    } catch (e) {
+        // ignore
     }
-};
+});
 
 // 记录视频总时长
 player.onloadedmetadata = function() {
@@ -1364,12 +1629,6 @@ player.onloadedmetadata = function() {
         localStorage.setItem(durationKey, player.duration);
         // 立即上报一次状态
         reportPlayStatus();
-    }
-    // 只启用第一个音轨
-    if (player.audioTracks && player.audioTracks.length > 1) {
-        for (let i = 0; i < player.audioTracks.length; i++) {
-            player.audioTracks[i].enabled = (i === 0);
-        }
     }
 };
 
@@ -1703,6 +1962,8 @@ def health_check():
         'status': 'running',
         'pid': os.getpid()
     })
+
+
 
 @app.route('/verify-secret', methods=['POST'])
 def verify_secret():
@@ -2740,5 +3001,6 @@ if __name__ == '__main__':
     except Exception as e:
         show_message_box("视频服务器 - 启动失败", f"启动失败！\n\n错误信息: {str(e)}", 16)
         sys.exit(1)
+
 
 
