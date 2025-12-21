@@ -1365,6 +1365,12 @@ player.onloadedmetadata = function() {
         // 立即上报一次状态
         reportPlayStatus();
     }
+    // 只启用第一个音轨
+    if (player.audioTracks && player.audioTracks.length > 1) {
+        for (let i = 0; i < player.audioTracks.length; i++) {
+            player.audioTracks[i].enabled = (i === 0);
+        }
+    }
 };
 
 // 视频播放结束事件
@@ -2734,4 +2740,5 @@ if __name__ == '__main__':
     except Exception as e:
         show_message_box("视频服务器 - 启动失败", f"启动失败！\n\n错误信息: {str(e)}", 16)
         sys.exit(1)
+
 
