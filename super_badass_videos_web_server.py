@@ -392,7 +392,7 @@ def index():
         /* 移动端侧边栏样式 */
         body.mobile #sidebar {
             width: 100%;
-            height: 40vh;
+            height: 60vh;
             position: fixed;
             bottom: 0;
             left: 0;
@@ -2716,3 +2716,4 @@ if __name__ == '__main__':
     except Exception as e:
         show_message_box("视频服务器 - 启动失败", f"启动失败！\n\n错误信息: {str(e)}", 16)
         sys.exit(1)
+
