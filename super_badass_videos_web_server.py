@@ -114,10 +114,26 @@ if not os.path.exists(SECRET_VIDEO_ROOT):
 valid_tokens = {}
 TOKEN_USED_CLEANUP_TIME = 3600  # Token清理时间1小时
 
+# 客户端唯一ID管理
+client_id_counter = 0
+client_id_lock = threading.Lock()
+CLIENT_ID_MAX = 2**64 - 1  # 64位最大值
+
+def generate_client_id():
+    """生成唯一的客户端ID（64位递增）"""
+    global client_id_counter
+    with client_id_lock:
+        client_id = client_id_counter
+        client_id_counter += 1
+        if client_id_counter > CLIENT_ID_MAX:
+            client_id_counter = 0
+    return str(client_id)
+
 # 连接监控
 active_connections = {}
 connection_lock = threading.Lock()
-CONNECTION_TIMEOUT = 30
+CONNECTION_TIMEOUT = 20  # 心跳超时时间改为20秒
+HEARTBEAT_INTERVAL = 10  # 心跳间隔10秒
 MAX_CONNECTIONS = 100
 cleanup_thread = None
 
@@ -245,12 +261,13 @@ def cleanup_expired_connections():
             
             with connection_lock:
                 connection_count = len(active_connections)
-                expired = [ip for ip, info in active_connections.items() 
+                # 清理超过20秒未心跳的客户端
+                expired = [client_id for client_id, info in active_connections.items() 
                           if current_time - info.get('last_seen', 0) > CONNECTION_TIMEOUT]
                 
                 if expired:
-                    for ip in expired:
-                        del active_connections[ip]
+                    for client_id in expired:
+                        del active_connections[client_id]
             
             cleaned_tokens = clean_expired_tokens()
             
@@ -275,30 +292,40 @@ def cleanup_oldest_connections(count=10):
         if len(active_connections) >= MAX_CONNECTIONS:
             sorted_connections = sorted(active_connections.items(), 
                                        key=lambda x: x[1].get('last_seen', 0))
-            for ip, _ in sorted_connections[:count]:
-                del active_connections[ip]
+            for client_id, _ in sorted_connections[:count]:
+                del active_connections[client_id]
 
 @app.before_request
 def track_connection():
     """跟踪和记录客户端连接信息"""
-    if request.path in ['/monitor', '/monitor-data']:
+    # 不监控 /monitor 和 /monitor-data 请求
+    if request.path.startswith('/monitor'):
+        return
+    
+    # 获取客户端ID（从请求参数或header中）
+    client_id = request.args.get('client_id') or request.headers.get('X-Client-ID')
+    
+    # 如果没有client_id，说明是旧请求，忽略跟踪
+    if not client_id:
         return
     
     client_ip = request.remote_addr
     client_port = request.environ.get('REMOTE_PORT', 'N/A')
     server_ip = request.host.split(':')[0]
     
-    if client_ip not in active_connections and len(active_connections) >= MAX_CONNECTIONS:
+    if client_id not in active_connections and len(active_connections) >= MAX_CONNECTIONS:
         cleanup_oldest_connections(10)
     
     with connection_lock:
-        if client_ip not in active_connections:
+        if client_id not in active_connections:
             if len(active_connections) >= MAX_CONNECTIONS:
                 cleanup_oldest_connections(10)
             
             interface_name = get_interface_name(server_ip)
             
-            active_connections[client_ip] = {
+            active_connections[client_id] = {
+                'client_id': client_id,
+                'client_ip': client_ip,
                 'server_ip': server_ip,
                 'client_port': client_port,
                 'interface': interface_name,
@@ -311,8 +338,10 @@ def track_connection():
                 'connected_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
         else:
-            active_connections[client_ip]['last_seen'] = time.time()
-            active_connections[client_ip]['client_port'] = client_port
+            # 更新最后心跳时间和可能变化的端口
+            active_connections[client_id]['last_seen'] = time.time()
+            active_connections[client_id]['client_ip'] = client_ip
+            active_connections[client_id]['client_port'] = client_port
 
 @app.route('/')
 def index():
@@ -392,7 +421,7 @@ def index():
         /* 移动端侧边栏样式 */
         body.mobile #sidebar {
             width: 100%;
-            height: 60vh;
+            height: 68vh;
             position: fixed;
             bottom: 0;
             left: 0;
@@ -1147,10 +1176,77 @@ let currentVideo = null;
 let allVideos = [];
 let isAutoplayEnabled = false;
 let isFullpageMode = false;
+let clientId = null;
+let heartbeatInterval = 10000; // 默认10秒
+let heartbeatTimer = null;
 
 // 获取URL参数
 const urlParams = new URLSearchParams(window.location.search);
 const secretToken = urlParams.get('secretnumber') || '';
+
+// 初始化客户端ID
+async function initializeClient() {
+    try {
+        const response = await fetch('/get-client-id');
+        const data = await response.json();
+        clientId = data.client_id;
+        heartbeatInterval = (data.heartbeat_interval || 10) * 1000;
+        
+        // 启动心跳
+        startHeartbeat();
+        
+        console.log('客户端ID已获取:', clientId);
+    } catch (error) {
+        console.error('获取客户端ID失败:', error);
+        // 重试
+        setTimeout(initializeClient, 5000);
+    }
+}
+
+// 发送心跳信号
+async function sendHeartbeat() {
+    if (!clientId) return;
+    
+    try {
+        const url = '/heartbeat?client_id=' + clientId;
+        const response = await fetch(url, { method: 'POST' });
+        const data = await response.json();
+        
+        if (!data.success && data.reregister) {
+            // 需要重新注册
+            console.log('客户端已过期，重新注册');
+            await initializeClient();
+        }
+    } catch (error) {
+        console.error('心跳发送失败:', error);
+    }
+}
+
+// 启动心跳定时器
+function startHeartbeat() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+    }
+    heartbeatTimer = setInterval(sendHeartbeat, heartbeatInterval);
+}
+
+// 停止心跳
+function stopHeartbeat() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+    }
+}
+
+// 构建带client_id的URL
+function buildUrl(path) {
+    if (!clientId) return path;
+    const separator = path.includes('?') ? '&' : '?';
+    return path + separator + 'client_id=' + clientId;
+}
+
+// 页面加载时初始化客户端
+initializeClient();
 
 // 如果是秘密模式，监听页面刷新事件
 if (isSecretMode) {
@@ -1175,31 +1271,44 @@ if (isSecretMode) {
     });
 }
 
-// 加载视频列表
-const videosUrl = secretToken ? '/videos?secretnumber=' + secretToken : '/videos';
-fetch(videosUrl).then(r => r.json()).then(list => {
-    allVideos = list;
-    renderVideoList(list);
-    videoCount.textContent = `共 ${list.length} 个视频`;
-    
-    // 自动加载上次播放的视频（秘密模式下使用不同的key）
-    const storageKey = isSecretMode ? 'lastSecretVideo' : 'lastVideo';
-    const lastVideo = localStorage.getItem(storageKey);
-    if (lastVideo && list.includes(lastVideo)) loadVideo(lastVideo);
-    
-    // 恢复连续播放状态
-    const autoplayKey = isSecretMode ? 'autoplaySecretEnabled' : 'autoplayEnabled';
-    const savedAutoplay = localStorage.getItem(autoplayKey);
-    if (savedAutoplay === 'true') {
-        isAutoplayEnabled = true;
-        updateAutoplayButton();
+// 加载视频列表（等待客户端ID就绪）
+async function loadVideoList() {
+    // 等待客户端ID
+    while (!clientId) {
+        await new Promise(resolve => setTimeout(resolve, 100));
     }
     
-    // 恢复全页面播放状态
-    if (lastVideo && list.includes(lastVideo)) {
-        restoreFullpageMode();
-    }
-});
+    const videosUrl = secretToken ? 
+        buildUrl('/videos?secretnumber=' + secretToken) : 
+        buildUrl('/videos');
+    
+    fetch(videosUrl).then(r => r.json()).then(list => {
+        allVideos = list;
+        renderVideoList(list);
+        videoCount.textContent = `共 ${list.length} 个视频`;
+        
+        // 自动加载上次播放的视频（秘密模式下使用不同的key）
+        const storageKey = isSecretMode ? 'lastSecretVideo' : 'lastVideo';
+        const lastVideo = localStorage.getItem(storageKey);
+        if (lastVideo && list.includes(lastVideo)) loadVideo(lastVideo);
+        
+        // 恢复连续播放状态
+        const autoplayKey = isSecretMode ? 'autoplaySecretEnabled' : 'autoplayEnabled';
+        const savedAutoplay = localStorage.getItem(autoplayKey);
+        if (savedAutoplay === 'true') {
+            isAutoplayEnabled = true;
+            updateAutoplayButton();
+        }
+        
+        // 恢复全页面播放状态
+        if (lastVideo && list.includes(lastVideo)) {
+            restoreFullpageMode();
+        }
+    });
+}
+
+// 启动视频列表加载
+loadVideoList();
 
 function renderVideoList(list) {
     videoListEl.innerHTML = '';
@@ -1273,9 +1382,14 @@ function renderVideoList(list) {
 
 function loadVideo(v, startFromBeginning = false) {
     currentVideo = v;
-    const videoUrl = secretToken ? 
-        '/video/' + encodeURIComponent(v) + '?secretnumber=' + secretToken : 
-        '/video/' + encodeURIComponent(v);
+    
+    // 构建视频URL，添加client_id
+    let videoUrl;
+    if (secretToken) {
+        videoUrl = buildUrl('/video/' + encodeURIComponent(v) + '?secretnumber=' + secretToken);
+    } else {
+        videoUrl = buildUrl('/video/' + encodeURIComponent(v));
+    }
     
     player.src = videoUrl;
     videoTitle.textContent = v;
@@ -1320,6 +1434,9 @@ function loadVideo(v, startFromBeginning = false) {
     //     sidebar.classList.add('collapsed');
     // }
     
+    // 滚动当前视频到视图中央
+    setTimeout(scrollCurrentVideoToCenter, 100);
+    
     // 恢复全页面播放状态
     restoreFullpageMode();
     
@@ -1331,8 +1448,9 @@ function loadVideo(v, startFromBeginning = false) {
 
 // 上报播放状态到服务器
 function reportPlayStatus() {
-    if (currentVideo && player.duration) {
-        fetch('/update-status', {
+    if (currentVideo && player.duration && clientId) {
+        const url = buildUrl('/update-status');
+        fetch(url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1573,10 +1691,41 @@ if (!isMobile) {
     });
 }
 
+// 滚动当前播放视频到视图中央
+function scrollCurrentVideoToCenter() {
+    if (!currentVideo) return;
+    
+    // 找到当前激活的视频项
+    const activeItem = document.querySelector('.video-item.active');
+    if (!activeItem) return;
+    
+    // 获取滚动容器
+    const scrollContainer = document.querySelector('.scrollable-content');
+    if (!scrollContainer) return;
+    
+    // 计算需要滚动的位置（将元素居中）
+    const containerHeight = scrollContainer.clientHeight;
+    const itemTop = activeItem.offsetTop;
+    const itemHeight = activeItem.offsetHeight;
+    
+    // 计算滚动位置，使元素在容器中央
+    const scrollPosition = itemTop - (containerHeight / 2) + (itemHeight / 2);
+    
+    // 平滑滚动到目标位置
+    scrollContainer.scrollTo({
+        top: Math.max(0, scrollPosition),
+        behavior: 'smooth'
+    });
+}
+
 // 移动端侧边栏切换
 if (isMobile) {
     sidebarHeader.addEventListener('click', function() {
         sidebar.classList.toggle('collapsed');
+        // 侧边栏展开时，滚动当前视频到中央
+        if (!sidebar.classList.contains('collapsed')) {
+            setTimeout(scrollCurrentVideoToCenter, 300); // 等待展开动画完成
+        }
     });
     
     // 初始化时不再自动收起
@@ -1585,6 +1734,11 @@ if (isMobile) {
     //         sidebar.classList.add('collapsed');
     //     }
     // }, 2000);
+} else {
+    // 桌面端：点击侧边栏标题也滚动到当前视频
+    sidebarHeader.addEventListener('click', function() {
+        scrollCurrentVideoToCenter();
+    });
 }
 
 // 全屏功能
@@ -1704,6 +1858,31 @@ def health_check():
         'pid': os.getpid()
     })
 
+@app.route('/get-client-id')
+def get_client_id():
+    """为客户端生成唯一ID"""
+    client_id = generate_client_id()
+    return jsonify({
+        'client_id': client_id,
+        'heartbeat_interval': HEARTBEAT_INTERVAL
+    })
+
+@app.route('/heartbeat', methods=['POST'])
+def heartbeat():
+    """接收客户端心跳信号"""
+    client_id = request.args.get('client_id') or request.headers.get('X-Client-ID')
+    
+    if not client_id:
+        return jsonify({'success': False, 'error': 'No client_id'}), 400
+    
+    with connection_lock:
+        if client_id in active_connections:
+            active_connections[client_id]['last_seen'] = time.time()
+            return jsonify({'success': True})
+        else:
+            # 客户端不存在，可能已超时被清理，返回需要重新注册
+            return jsonify({'success': False, 'error': 'Client not found', 'reregister': True}), 404
+
 @app.route('/verify-secret', methods=['POST'])
 def verify_secret():
     """验证密码并生成访问Token"""
@@ -1732,18 +1911,22 @@ def invalidate_token():
 def update_status():
     """接收并更新客户端播放状态"""
     data = request.get_json()
-    client_ip = request.remote_addr
+    client_id = request.args.get('client_id') or request.headers.get('X-Client-ID')
+    
+    if not client_id:
+        return jsonify({'success': False, 'error': 'No client_id'}), 400
     
     with connection_lock:
-        if client_ip in active_connections:
-            active_connections[client_ip].update({
+        if client_id in active_connections:
+            active_connections[client_id].update({
                 'video': data.get('video', '未播放'),
                 'position': data.get('position', 0),
                 'duration': data.get('duration', 0),
                 'last_seen': time.time()
             })
-    
-    return jsonify({'success': True})
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'Client not found'}), 404
 
 @app.route('/monitor')
 def monitor():
@@ -2289,6 +2472,10 @@ def monitor():
                                     </div>
                                     <div class="connection-details">
                                         <div class="detail-item">
+                                            <div class="detail-label">客户端ID</div>
+                                            <div class="detail-value">${conn.client_id}</div>
+                                        </div>
+                                        <div class="detail-item">
                                             <div class="detail-label">服务器接口</div>
                                             <div class="detail-value">${conn.interface}</div>
                                         </div>
@@ -2316,6 +2503,10 @@ def monitor():
                                         <div class="detail-item">
                                             <div class="detail-label">上传速率</div>
                                             <div class="detail-value">${conn.bandwidth_up.toFixed(2)} KB/s</div>
+                                        </div>
+                                        <div class="detail-item">
+                                            <div class="detail-label">连接时间</div>
+                                            <div class="detail-value">${conn.connected_at}</div>
                                         </div>
                                     </div>
                                 </div>
@@ -2387,13 +2578,23 @@ def monitor_data():
         if not auth or auth.username != MONITOR_USERNAME or auth.password != MONITOR_PASSWORD:
             return jsonify({'error': '认证失败'}), 401
     
-    # 优化：使用局部变量减少锁持有时间
+    # 清理过期连接，确保监控数据准确
+    current_time = time.time()
+    with connection_lock:
+        expired = [client_id for client_id, info in active_connections.items() 
+                  if current_time - info.get('last_seen', 0) > CONNECTION_TIMEOUT]
+        
+        if expired:
+            for client_id in expired:
+                del active_connections[client_id]
+    
+    # 获取当前活跃连接的快照
     connections_snapshot = []
     with connection_lock:
-        # 注意：不在这里清理，由后台线程负责清理
-        for client_ip, info in active_connections.items():
+        for client_id, info in active_connections.items():
             connections_snapshot.append({
-                'client_ip': client_ip,
+                'client_id': client_id,
+                'client_ip': info.get('client_ip', 'N/A'),
                 'client_port': info.get('client_port', 'N/A'),
                 'server_ip': info.get('server_ip', 'N/A'),
                 'interface': info.get('interface', 'N/A'),
@@ -2402,7 +2603,8 @@ def monitor_data():
                 'duration': info.get('duration', 0),
                 'bandwidth_down': info.get('bandwidth_down', 0),
                 'bandwidth_up': info.get('bandwidth_up', 0),
-                'last_seen': info.get('last_seen', 0)
+                'last_seen': info.get('last_seen', 0),
+                'connected_at': info.get('connected_at', 'N/A')
             })
     
     # 获取所有可访问的IP地址（在锁外执行）

@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller配置文件 - 视频Web服务器
 
-# 分析Python脚本及其依赖
+
 a = Analysis(
     ['super_badass_videos_web_server.py'],
     pathex=[],
@@ -15,11 +14,8 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-
-# 创建Python字节码存档
 pyz = PYZ(a.pure)
 
-# 创建可执行文件
 exe = EXE(
     pyz,
     a.scripts,
